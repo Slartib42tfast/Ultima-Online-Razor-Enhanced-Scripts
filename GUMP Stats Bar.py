@@ -5,9 +5,9 @@
 
 # USER SETTINGS:
 
-move_to_position = True # Allow the gump to be moved for 10 seconds.
 pos_x = 970             # The X screen position where you want the gump to open.
 pos_y = 807             # The Y screen position where you want the gump to open.
+move_to_position = True # Allow the gump to be moved for 10 seconds after start.
 
 # DO NOT CHANGE ANYTHING BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
 
@@ -100,6 +100,7 @@ def update_status_bar():
     #Gumps.AddLabel(gd, 190, 70, 1081, str(Player.MaxWeight))
 
     Gumps.CloseGump(123456)
+    CUO.SetGumpOpenLocation( 123456, pos_x, pos_y)
     Gumps.SendGump(123456, Player.Serial, pos_x, pos_y, gd.gumpDefinition, gd.gumpStrings)
 
 def position_status_bar():
