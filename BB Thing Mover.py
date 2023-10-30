@@ -314,8 +314,15 @@ class mainForm(Form):
                             Misc.SendMessage('You are outside banking range!\nDefaulting to your main backpack.', 89)
                             container = Player.Backpack
                     elif 'shop name:' in props[1].lower():
-                        Misc.SendMessage('You can target a container inside a vendor but cannot target a vendor! \nDefaulting to your main backpack.', 89)
-                        container = Player.Backpack
+                        if 'owner: '+Player.Name.lower() == props[3].lower() or 'owner: '+Player.Name.lower() == props[2].lower():
+                            Mobiles.UseMobile(container.Serial)
+                            Gumps.WaitForGump(797007452, 10000)
+                            Gumps.SendAction(797007452, 1)
+                            Misc.Pause(100)
+                            container = container.Backpack
+                        else:
+                            Misc.SendMessage('You cannot place items inside or retreive items from the vendor of another player! \nDefaulting to your main backpack.', 89)
+                            container = Player.Backpack
                     else:
                         Misc.SendMessage('{} is not a container! \nDefaulting to your main backpack.'.format(props[0].title()), 89)
                         #container = Player.Backpack
