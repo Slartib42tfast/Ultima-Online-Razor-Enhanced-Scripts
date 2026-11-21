@@ -6,26 +6,75 @@
 #                                                                           #
 #############################################################################
 
-import clr #, time, sys, System, math
-clr.AddReference('System.Drawing','System.Windows.Forms')
-import System.Drawing
-from pathlib import Path
-from datetime import datetime
-from System.Drawing import *
-from System.Threading import ThreadStart, Thread
-from System.Collections.Generic import List
-from System.Windows.Forms import (Application, Button, Form, BorderStyle, Label, FlatStyle, CheckBox, ListBox,
- FormBorderStyle, Orientation, TabControl, TabAlignment, TabPage, FormStartPosition, DockStyle, FormClosingEventHandler,
- FormClosedEventHandler)
+import clr
+clr.AddReference('System.Drawing')
+clr.AddReference('System.Windows.Forms')
+
+import re
+from datetime import datetime, timedelta
+from System import Action, Array
+from System.ComponentModel import ListSortDirection
+from System.IO import Directory, File
+from System.IO import Path as IOPath
+from System.Reflection import BindingFlags
+from System.Text import UTF8Encoding
+from System.Threading import ApartmentState, Thread, ThreadStart
+from System.Drawing import Color, Point, Size
+from System.Windows.Forms import (AnchorStyles, Application, Button, CheckBox, Clipboard, ContextMenuStrip,
+    DataGridView, DataGridViewAutoSizeColumnMode, DataGridViewCellBorderStyle, DataGridViewCellStyle,
+    DataGridViewClipboardCopyMode, DataGridViewColumnSortMode, DataGridViewContentAlignment,
+    DataGridViewSelectionMode, DataGridViewTextBoxColumn, DockStyle, FlatStyle, Form, FormBorderStyle,
+    FormStartPosition, Keys, Label, MouseButtons, SortOrder, TabAlignment, TabControl, TabPage,
+    ToolStripMenuItem)
 
 ####################   USER SETTINGS   ####################
-    
+
 positionH           = 500 # Horizontal starting position of the window
 positionV           = 500 # Vertical starting position of the window
 backgroundColor     = Color.FromArgb(193, 217, 224)
 textboxColor        = Color.FromArgb(193, 217, 224)
 textColor           = Color.FromArgb(31, 47, 61)
 buttonColor         = Color.FromArgb(241, 241, 241)
+gridLineColor       = Color.FromArgb(168, 193, 202)
+
+maxLinesPerTab      = 5000 # Oldest lines are dropped past this so memory use and redraw time stay flat
+duplicateWindowSecs = 3    # An identical line in the same tab within this many seconds is skipped (0 = never skip)
+pollIntervalMs      = 100  # How often the journal is read, in milliseconds
+
+# Column widths in pixels. 0 = the column fills the remaining width.
+# If more than one column is 0, those columns share the remaining width equally.
+# If none is 0, every column keeps its width and any extra space stays empty.
+timeColumnWidth     = 90
+typeColumnWidth     = 50
+speakerColumnWidth  = 80
+messageColumnWidth  = 0
+
+# Type cell colors: type label -> (cell color, text color)
+# Types not listed here use the normal grid colors
+white = Color.White
+dark  = Color.FromArgb(31, 47, 61)
+typeColors = {
+    'Staff':      (Color.FromArgb(190, 30, 45),   white),
+    'Public':     (Color.FromArgb(40, 100, 190),  white),
+    'Trade':      (Color.FromArgb(150, 95, 20),   white),
+    'Guild':      (Color.FromArgb(35, 130, 60),   white),
+    'Alliance':   (Color.FromArgb(20, 115, 120),  white),
+    'Party':      (Color.FromArgb(115, 60, 165),  white),
+    'Say':        (Color.FromArgb(240, 240, 240), dark),
+    'Emote':      (Color.FromArgb(215, 215, 215), dark),
+    'Whisper':    (Color.FromArgb(105, 105, 105), white),
+    'Yell':       (Color.FromArgb(215, 110, 20),  white),
+    'Combat':     (Color.FromArgb(140, 35, 35),   white),
+    'Death':      (Color.FromArgb(40, 40, 40),    white),
+    'Invasion':   (Color.FromArgb(225, 75, 0),    white),
+    'Save':       (Color.FromArgb(85, 85, 135),   white),
+    'Level Up':   (Color.FromArgb(225, 180, 40),  dark),
+    'Login':      (Color.FromArgb(120, 140, 150), white),
+    'New Member': (Color.FromArgb(55, 155, 135),  white),
+    'Stealth':    (Color.FromArgb(75, 75, 75),    white),
+    'You See':    (Color.FromArgb(165, 185, 195), dark),
+    'Spell':      (Color.FromArgb(95, 75, 190),   white),
+}
 
 # Add strings to this list to block messages containing them from showing in this script
 # Remove strings from this list to unblock them
@@ -38,685 +87,728 @@ blockMessagesContaining = ['Your arrow hits its mark with velocity!'
 
 ####################   APP SETTINGS - DO NOT TOUCH UNLESS YOU KNOW WHAT YOU ARE DOING   ####################
 
-scriptName =            'Journal Spy | {} ({})'.format(Player.Name,Misc.ShardName())
-reScriptDirectory =     '{}'.format(Misc.CurrentScriptDirectory())
-journalSpyFolder =      'Journal_Spy'
-journalSpyDirectory =   '\\'.join([reScriptDirectory, journalSpyFolder])
-exportFileName =        'Journal Spy - {} - {} -'.format(Misc.ShardName(),Player.Name)
-appSize =               Size(850 + 20, 325)
-#font =                  Font('Sans Serif',9)
-tabCombinedCounter =    0
-tabLocalCounter =       0
-tabWorldCounter =       0
-tabGuildCounter =       0
-tabPartyCounter =       0
-tabOtherCounter =       0
-previousLocal =         ''
-previousWorld =         ''
-previousGuild =         ''
-previousParty =         ''
-previousOther =         ''
+scriptName          = 'Journal Spy | {} ({})'.format(Player.Name, Misc.ShardName())
+journalSpyDirectory = IOPath.Combine(Misc.CurrentScriptDirectory(), 'Journal_Spy')
+exportFileName      = 'Journal Spy - {} - {} -'.format(Misc.ShardName(), Player.Name)
+appSize             = Size(850 + 20, 324)
+unixTimeBegin       = datetime(1970, 1, 1)
+trimBatchSize       = 200 # Trim old rows in batches instead of one by one
 
-Misc.SetSharedValue('run',True)
- 
-####################   MAIN FORM - START   ####################
-    
-class mainForm(Form):
-                    
-    previousLocal = ''
-    previousWorld = ''
-    previousGuild = ''
-    previousParty = ''
-    previousOther = ''
-    
+# Tabs in display order: key, tab label, name used in export file names
+TABS = [
+    ('combined', '← All Checked', 'All Checked'),
+    ('local',    'Local Speech',       'Local Speech'),
+    ('world',    'World Chat',         'World Chat'),
+    ('guild',    'Guild Chat',         'Guild Chat'),
+    ('party',    'Party Chat',         'Party Chat'),
+    ('other',    'Other',              'Other'),
+]
+
+# Grid columns: name, header, width (0 = fill the remaining width)
+COLUMNS = [
+    ('time',    'Time',    timeColumnWidth),
+    ('type',    'Type',    typeColumnWidth),
+    ('speaker', 'Speaker', speakerColumnWidth),
+    ('message', 'Message', messageColumnWidth),
+]
+fillMinimumWidth    = 60 # A filling column never gets narrower than this
+fixedMinimumWidth   = 20 # A set width below this is raised to it
+TIME_COLUMN = 0
+TYPE_COLUMN = 1
+SPEAKER_COLUMN = 2
+
+# Check boxes in display order: key, label, checked at start
+# A checked box copies lines of that kind into the All Checked tab
+FILTERS = [
+    ('local',        'Local Speech',    False),
+    ('world',        'World Chat',      False),
+    ('guild',        'Guild Chat',      False),
+    ('party',        'Party Chat',      False),
+    ('admins',       '+Admins',         True),
+    ('levelUps',     'Pet/Weap Level',  True),
+    ('combat',       'Combat',          False),
+    ('loggedInOut',  'Logged In / Out', False),
+    ('coreMacro',    'Core / Macro',    False), # Not matched by any rule yet
+    ('newestMember', 'Newest Member',   False),
+    ('stealthSteps', 'Stealth Steps',   False),
+    ('youSee',       'Character Names', False),
+    ('worldSave',    'World Save',      False),
+    ('deathRoll',    'Death Roll',      False),
+    ('misc',         'Miscellaneous',   False),
+]
+
+####################   MESSAGE MATCHING   ####################
+
+COMBAT_PHRASES = (
+    'enveloped by a noxious gas', 'stepped onto a blade trap', 'stepped onto a spike trap',
+    'feel pain throughout your body', 'damage has been healed', 'wracked with extreme pain',
+    'around in confusion and pain', 'Your deeds in the city of', 'You deliver a mortal wound',
+    'You play jarring music,', 'You heal what little damage', 'You attempt to disrupt',
+    'Choose the target for ', 'You pierce your opponent', 'You launch two shots at ',
+    'You have delivered a conc', 'The whirling attack strike', 'You are bleeding!',
+    'That being is not damaged', 'You have been cured of all', 'You finish applying the ',
+    'You begin applying the ', 'You did not earn the right', 'Warmode dismount blocked.',
+    'Choose a corpse to claim', 'Choose another corpse to', 'As a reward for slaying ',
+    'You have delivered a crushing', 'Your concentration is ', 'bleeding profusely',
+    're already casting a spell.', 'vered from casting a spell.', 'corpse and receive a reward.',
+    'and are in severe pain!', 'you are no longer bleeding!', 'You must have at least',
+    'spasm uncontrollably', 'can breathe normally', 'resisting magical energy',
+    'target is not affected', 'Oath has been broken', 'dry and corpselike', 'looks ill',
+    'hits its mark with velocity', 'Your target is bleeding', 'looks extrememly ill', '%]',
+    't claim a corpse you did not kill', 'You are too far away to claim that corpse',
+    'You feel a bit nauseous', 'You are in extreme pain,', 'You feel disoriented and nauseous',
+    'poison seems to have no effect', 'looks extremely ill.', 'seems resistant to the poison',
+)
+
+ADMIN_PHRASES = ('] +', '> +', '] Announcement by +', 'Staff message from +')
+
+WORLD_SAVE_PHRASES = (
+    'The world will save in ', 'The world is saving, please wait.', 'No Current News',
+    'World save complete. ', 'Power Save! All players online ', 'Power Save! All online players ',
+)
+
+LEVEL_UP_PHRASES = (
+    'Your strength has changed', 'Your dexterity has changed', 'Your intelligence has changed',
+    'Your skill in', 'has gained a level',
+)
+
+DEATH_PHRASES = (
+    'Pray, bretheren', 'Alas, poor', 'Another soul has', 'Rest in peace,', 'We mourn the passing',
+    ' is heard throughout the land.', 'shall arise again for vengance!', ' the regions beyond the grave.',
+    'has fallen victim to', 'shall rise again for vengance', 'has been slain in a br',
+    'inflicted the final wo', 'has lost their life in battle to',
+    'has succumbed to their wounds and has perished', 'may god have mercy on your soul',
+    'Death comes for us all, but on this day, for',
+)
+
+STEALTH_PHRASES = ('Stealth steps', 'You begin to move quietely', 'You begin to move quietly')
+
+REGULAR_MISC_PHRASES = (
+    ' : ', 'lock quickly yields', 'appears to be locked.', 'make anything of the map',
+    'decode a treasure map', 'marked by the red pin', 'hidden yourself well', 'seem to hide right now',
+)
+
+# Chat lines that carry their own channel and speaker, in the formats shards commonly use:
+#   <Public> Name: text      [Guild] Name: text      [Guild][Name]: text      <Guild> [Name]: text
+CHANNEL_LINE = re.compile(
+    r'^\s*[<\[]\s*([^<>\[\]]{1,24}?)\s*[>\]]\s*'     # channel in <...> or [...]
+    r'(?:\[\s*([^\[\]]{1,40}?)\s*\]|([^:<>\[\]]{1,40}?))'  # speaker, with or without brackets
+    r'\s*:\s?(.*)$', re.S)                           # colon, then the message
+
+def parseChannelLine(t):
+    # Returns (channel, speaker, message), or None when the line is not a chat line
+    m = CHANNEL_LINE.match(t)
+    if m is None:
+        return None
+    speaker = (m.group(2) or m.group(3) or '').strip()
+    if speaker.startswith('Announcement by '):
+        speaker = speaker[len('Announcement by '):]
+    return m.group(1).strip(), speaker, m.group(4)
+
+def containsAny(text, phrases):
+    return any(p in text for p in phrases)
+
+def isCombat(t):
+    if 'corpse' in t and (' a ' in t or ' an ' in t or "'s " in t):
+        return True
+    if 'You received' in t and 'tokens.' in t:
+        return True
+    return containsAny(t, COMBAT_PHRASES)
+
+def isInvasion(t):
+    return (('is being invaded by' in t and '. Please come help!' in t)
+            or ('is safe!' in t and 'has been defeated!' in t)
+            or ('has been protected but' in t and 'for the final battle!' in t))
+
+def isDeathRoll(t):
+    return ('couldn' in t and 't withstand' in t) or containsAny(t, DEATH_PHRASES)
+
+def groupChannel(channel):
+    # Guild, alliance and party channels: returns (tab key, filter key, type label), or None
+    name = channel.lower()
+    if name == 'party':
+        return 'party', 'party', 'Party'
+    if name == 'alliance':
+        return 'guild', 'guild', 'Alliance'
+    if name == 'guild':
+        return 'guild', 'guild', 'Guild'
+    return None
+
+def classifySystem(t, parsed):
+    # Returns (tab key, filter key, type label)
+    channel = parsed[0] if parsed else ''
+    if '<' in t and '> ' in t:
+        if '> +' in t:
+            return 'world', 'admins', 'Staff'
+        if '<Public> ' in t:
+            return 'world', 'world', 'Public'
+        if '<Trade> ' in t:
+            return 'world', 'world', 'Trade'
+        if '<ESC> to cancel' in t:
+            return 'other', 'misc', 'System'
+        return groupChannel(channel) or ('guild', 'guild', 'Guild')
+    if groupChannel(channel):
+        return groupChannel(channel)
+    if 'You see:' in t:
+        return 'other', 'youSee', 'You See'
+    if isCombat(t):
+        return 'other', 'combat', 'Combat'
+    if containsAny(t, ADMIN_PHRASES):
+        return 'world', 'admins', 'Staff'
+    if isInvasion(t):
+        return 'world', 'misc', 'Invasion'
+    if ' has logged ' in t:
+        return 'other', 'loggedInOut', 'Login'
+    if containsAny(t, WORLD_SAVE_PHRASES):
+        return 'other', 'worldSave', 'Save'
+    if containsAny(t, LEVEL_UP_PHRASES):
+        return 'other', 'levelUps', 'Level Up'
+    if isDeathRoll(t):
+        return 'other', 'deathRoll', 'Death'
+    if 'elcome the newest member ' in t:
+        return 'other', 'newestMember', 'New Member'
+    if containsAny(t, STEALTH_PHRASES):
+        return 'other', 'stealthSteps', 'Stealth'
+    return 'other', 'misc', 'System'
+
+def classify(entry):
+    # Returns (tab key, filter key, type label, speaker, message), or None to ignore the entry
+    kind = entry.Type
+    name = entry.Name or ''
+    if name == 'System':
+        name = ''
+    t = entry.Text or ''
+
+    if kind == 'System':
+        parsed = parseChannelLine(t)
+        tabKey, filterKey, label = classifySystem(t, parsed)
+        if parsed:
+            return tabKey, filterKey, label, parsed[1], parsed[2]
+        return tabKey, filterKey, label, '', t
+
+    if kind in ('Guild', 'Party', 'Alliance'):
+        speaker, message = name, t
+        if not name:
+            parsed = parseChannelLine(t)
+            if parsed:
+                speaker, message = parsed[1], parsed[2]
+        if kind == 'Guild':
+            return 'guild', 'guild', 'Guild', speaker, message
+        if kind == 'Party':
+            return 'party', 'party', 'Party', speaker, message
+        return 'other', 'misc', 'Alliance', speaker, message
+
+    if kind == 'Regular':
+        if isCombat(t):
+            return 'other', 'combat', 'Combat', name, t
+        if containsAny(t, REGULAR_MISC_PHRASES):
+            return 'other', 'misc', 'Misc', name, t
+        return 'local', 'local', 'Say', name, t
+    if kind == 'Emote':
+        if 'poison seems to have no effect' in t or 'seems resistant to the poison' in t:
+            return 'other', 'combat', 'Combat', name, t
+        if 'begins taming a creature' in t:
+            return 'other', 'misc', 'Emote', name, t
+        return 'local', 'local', 'Emote', name, t
+    if kind == 'Label':
+        return 'other', 'youSee', 'You See', '', t
+    if kind == 'Whisper':
+        return 'local', 'local', 'Whisper', name, t
+    if kind == 'Yell':
+        return 'local', 'local', 'Yell', name, t
+    if kind == 'Spell':
+        return 'other', 'misc', 'Spell', name, t
+    if kind in ('Focus', 'Encoded', 'Special'):
+        return 'other', 'misc', kind, name, t
+    return None
+
+####################   HELPERS   ####################
+
+def journalTimeNow():
+    # Same clock RE uses for journal timestamps: local time as seconds since 1970
+    return (datetime.now() - unixTimeBegin).total_seconds()
+
+def formatTime(timestamp):
+    return (unixTimeBegin + timedelta(seconds=float(timestamp))).strftime('%m/%d  %X')
+
+def safeFileName(name):
+    for ch in IOPath.GetInvalidFileNameChars():
+        name = name.replace(str(ch), '_')
+    return name
+
+def csvField(value):
+    text = '' if value is None else str(value)
+    # A cell starting with these is run as a formula by Excel, so chat text could trigger one.
+    # A leading apostrophe makes Excel treat it as plain text.
+    if text[:1] in ('=', '+', '-', '@', '\t', '\r'):
+        text = "'" + text
+    return '"' + text.replace('"', '""') + '"'
+
+def copyToClipboard(text):
+    # The clipboard only works from a single thread apartment (STA) thread, so use a short lived one
+    result = {}
+    def run():
+        try:
+            Clipboard.SetText(text)
+        except Exception as e:
+            result['error'] = e
+    worker = Thread(ThreadStart(run))
+    worker.SetApartmentState(ApartmentState.STA)
+    worker.IsBackground = True
+    worker.Start()
+    if not worker.Join(2000):
+        raise Exception('clipboard did not respond')
+    if 'error' in result:
+        raise result['error']
+
+def enableDoubleBuffering(control):
+    # Less flicker while rows are added. DoubleBuffered is not public on DataGridView.
+    try:
+        prop = clr.GetClrType(DataGridView).GetProperty('DoubleBuffered', BindingFlags.Instance | BindingFlags.NonPublic)
+        prop.SetValue(control, True, None)
+    except Exception:
+        pass
+
+####################   MAIN FORM   ####################
+
+class JournalSpyForm(Form):
+
     def __init__(self):
-        #Form.__init__(self)
-        self.Text = '{}'.format(scriptName)
+        self.stopping = False
+        self.lastTimestamp = None
+        self.seenAtLastTimestamp = set()
+        self.lastLineByTab = {}
+        self.lastError = ''
+
+        self.Text = scriptName
         self.BackColor = backgroundColor
         self.ForeColor = textColor
+        self.FormBorderStyle = FormBorderStyle.Sizable # Set before the size so the border is counted correctly
         self.ClientSize = appSize
-        self.MinimumSize = appSize
-        self.FormBorderStyle = FormBorderStyle.Fixed3D
+        self.MinimumSize = self.Size # Can grow, but never smaller than the starting size
         self.StartPosition = FormStartPosition.Manual
-        self.Location = Point(positionH,positionV)
+        self.Location = Point(positionH, positionV)
         self.TopMost = True
-        self.FormClosing += self.abortThreads
-        self.FormClosed += self.abortThreads
-        self.Show()
- 
-        ####################   DEFINE CONTROLS   ####################
-   
-        self.localSpeechCheck = CheckBox()
-        self.localSpeechCheck.Text = 'Local Speech'
-        self.localSpeechCheck.Checked = False
-        self.localSpeechCheck.Location = Point(5, 5)
-        self.localSpeechCheck.Size = Size(115, 20)
-        self.Controls.Add(self.localSpeechCheck)
-   
-        self.worldChatCheck = CheckBox()
-        self.worldChatCheck.Text = 'World Chat'
-        self.worldChatCheck.Checked = False
-        self.worldChatCheck.Location = Point(5, 25)
-        self.worldChatCheck.Size = Size(115, 20)
-        self.Controls.Add(self.worldChatCheck)
-   
-        self.guildChatCheck = CheckBox()
-        self.guildChatCheck.Text = 'Guild Chat'
-        self.guildChatCheck.Checked = False
-        self.guildChatCheck.Location = Point(5, 45)
-        self.guildChatCheck.Size = Size(115, 20)
-        self.Controls.Add(self.guildChatCheck)
-   
-        self.partyChatCheck = CheckBox()
-        self.partyChatCheck.Text = 'Party Chat'
-        self.partyChatCheck.Checked = False
-        self.partyChatCheck.Location = Point(5, 65)
-        self.partyChatCheck.Size = Size(115, 20)
-        self.Controls.Add(self.partyChatCheck)
-   
-        self.adminsCheck = CheckBox()
-        self.adminsCheck.Text = '+Admins'
-        self.adminsCheck.Checked = True
-        self.adminsCheck.Location = Point(5, 85)
-        self.adminsCheck.Size = Size(115, 20)
-        self.Controls.Add(self.adminsCheck)
-   
-        self.levelUpsCheck = CheckBox()
-        self.levelUpsCheck.Text = 'Pet/Weap Level'
-        self.levelUpsCheck.Checked = True
-        self.levelUpsCheck.Location = Point(5, 105)
-        self.levelUpsCheck.Size = Size(115, 20)
-        self.Controls.Add(self.levelUpsCheck)
-   
-        self.combatCheck = CheckBox()
-        self.combatCheck.Text = 'Combat'
-        self.combatCheck.Checked = False
-        self.combatCheck.Location = Point(5, 125)
-        self.combatCheck.Size = Size(115, 20)
-        self.Controls.Add(self.combatCheck)
-   
-        self.loggedInOutCheck = CheckBox()
-        self.loggedInOutCheck.Text = 'Logged In / Out'
-        self.loggedInOutCheck.Checked = False
-        self.loggedInOutCheck.Location = Point(5, 145)
-        self.loggedInOutCheck.Size = Size(115, 20)
-        self.Controls.Add(self.loggedInOutCheck)
-   
-        self.coreMacroCheck = CheckBox()
-        self.coreMacroCheck.Text = 'Core / Macro'
-        self.coreMacroCheck.Checked = False
-        self.coreMacroCheck.Location = Point(5, 165)
-        self.coreMacroCheck.Size = Size(115, 20)
-        self.Controls.Add(self.coreMacroCheck)
-   
-        self.newestMemberCheck = CheckBox()
-        self.newestMemberCheck.Text = 'Newest Member'
-        self.newestMemberCheck.Checked = False
-        self.newestMemberCheck.Location = Point(5, 185)
-        self.newestMemberCheck.Size = Size(115, 20)
-        self.Controls.Add(self.newestMemberCheck)
-   
-        self.stealthStepsCheck = CheckBox()
-        self.stealthStepsCheck.Text = 'Stealth Steps'
-        self.stealthStepsCheck.Checked = False
-        self.stealthStepsCheck.Location = Point(5, 205)
-        self.stealthStepsCheck.Size = Size(115, 20)
-        self.Controls.Add(self.stealthStepsCheck)
-   
-        self.youSeeCheck = CheckBox()
-        self.youSeeCheck.Text = 'Character Names'
-        self.youSeeCheck.Checked = False
-        self.youSeeCheck.Location = Point(5, 225)
-        self.youSeeCheck.Size = Size(115, 20)
-        self.Controls.Add(self.youSeeCheck)
-   
-        self.worldSaveCheck = CheckBox()
-        self.worldSaveCheck.Text = 'World Save'
-        self.worldSaveCheck.Checked = False
-        self.worldSaveCheck.Location = Point(5, 245)
-        self.worldSaveCheck.Size = Size(115, 20)
-        self.Controls.Add(self.worldSaveCheck)
-   
-        self.deathRollCheck = CheckBox()
-        self.deathRollCheck.Text = 'Death Roll'
-        self.deathRollCheck.Checked = False
-        self.deathRollCheck.Location = Point(5, 265)
-        self.deathRollCheck.Size = Size(115, 20)
-        self.Controls.Add(self.deathRollCheck)
-   
-        self.miscCheck = CheckBox()
-        self.miscCheck.Text = 'Miscellaneous'
-        self.miscCheck.Checked = False
-        self.miscCheck.Location = Point(5, 285)
-        self.miscCheck.Size = Size(115, 20)
-        self.Controls.Add(self.miscCheck)
+        self.FormClosing += self.onClosing
+        self.Shown += self.onShown
+
+        ####################   CHECK BOXES   ####################
+
+        self.checks = {}
+        for i, (key, label, checked) in enumerate(FILTERS):
+            box = CheckBox()
+            box.Text = label
+            box.Checked = checked
+            box.Location = Point(5, 5 + 20 * i)
+            box.Size = Size(115, 20)
+            self.Controls.Add(box)
+            self.checks[key] = box
+
+        ####################   BOTTOM ROW   ####################
 
         self.exportButton = Button()
-        if Path(journalSpyDirectory).exists():
-            self.exportButton.Text = 'Export All Checked'
-        else:
-            self.exportButton.Text = 'Enable Export to File'
         self.exportButton.BackColor = buttonColor
         self.exportButton.Location = Point(120, 295)
         self.exportButton.Size = Size(150, 25)
         self.exportButton.FlatStyle = FlatStyle.Flat
-        self.exportButton.FlatAppearance.BorderSize = 1 
-        self.exportButton.Click += self.btnPressedEvent
+        self.exportButton.FlatAppearance.BorderSize = 1
+        self.exportButton.Click += self.onExport
+        self.exportButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
         self.Controls.Add(self.exportButton)
-   
+
         self.autoScroll = CheckBox()
         self.autoScroll.Text = 'Auto-scroll'
         self.autoScroll.Checked = True
         self.autoScroll.Location = Point(793, 298)
         self.autoScroll.Size = Size(77, 20)
+        self.autoScroll.Anchor = AnchorStyles.Bottom | AnchorStyles.Right
+        self.autoScroll.CheckedChanged += self.onAutoScrollChanged
         self.Controls.Add(self.autoScroll)
-   
+
         self.systemNotification = Label()
         self.systemNotification.Text = ''
         self.systemNotification.ForeColor = textColor
         self.systemNotification.Location = Point(270, 301)
-        self.systemNotification.Size = Size(540, 20)
+        self.systemNotification.Size = Size(520, 20)
+        self.systemNotification.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
         self.Controls.Add(self.systemNotification)
- 
-        ####################   TAB CONTROLS - START   ####################
-        
-        self.tabControl = TabControl()        
+
+        ####################   GRID STYLES AND MENU   ####################
+
+        self.typeStyles = {}
+        for label, (back, fore) in typeColors.items():
+            style = DataGridViewCellStyle()
+            style.BackColor = back
+            style.ForeColor = fore
+            style.SelectionBackColor = back # Keeps the type color visible on selected rows
+            style.SelectionForeColor = fore
+            self.typeStyles[label] = style
+
+        self.gridMenu = ContextMenuStrip()
+        copyItem = ToolStripMenuItem('Copy selected rows')
+        copyItem.Click += self.onCopyMenu
+        self.gridMenu.Items.Add(copyItem)
+
+        ####################   TABS   ####################
+
+        self.tabControl = TabControl()
         self.tabControl.Location = Point(120, 0)
-        self.tabControl.Size = Size(750, 290)
+        self.tabControl.Size = Size(750, 291)
         self.tabControl.Alignment = TabAlignment.Top
-        self.tabControl.SelectedIndexChanged += self.tabSelectedEvent
+        self.tabControl.SelectedIndexChanged += self.onTabSelected
+        self.tabControl.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
         self.Controls.Add(self.tabControl)
- 
-        ####################   DEFINE TAB 1   ####################
-        
-        self.tabCombined = TabPage()
-        self.tabCombined.Text = '← All Checked'
-        self.tabCombined.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabCombined)
-        
-        self.chatBoxCombined = ListBox()
-        self.chatBoxCombined.Dock = DockStyle.Fill
-        self.chatBoxCombined.BackColor = textboxColor
-        #self.chatBoxCombined.Font = font
-        self.chatBoxCombined.ForeColor = textColor
-        self.chatBoxCombined.HorizontalScrollbar = True
-        self.tabCombined.Controls.Add(self.chatBoxCombined)
- 
-        ####################   DEFINE TAB 2   ####################
-        
-        self.tabLocal = TabPage()
-        self.tabLocal.Text = 'Local Speech'
-        self.tabLocal.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabLocal)
-        
-        self.chatBoxLocal = ListBox()
-        self.chatBoxLocal.Dock = DockStyle.Fill
-        self.chatBoxLocal.BackColor = textboxColor
-        #self.chatBoxLocal.Font = font
-        self.chatBoxLocal.ForeColor = textColor
-        self.chatBoxLocal.HorizontalScrollbar = True
-        self.tabLocal.Controls.Add(self.chatBoxLocal)
- 
-        ####################   DEFINE TAB 3   ####################
-        
-        self.tabWorld = TabPage()
-        self.tabWorld.Text = 'World Chat'
-        self.tabWorld.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabWorld)
-        
-        self.chatBoxWorld = ListBox()
-        self.chatBoxWorld.Dock = DockStyle.Fill
-        self.chatBoxWorld.BackColor = textboxColor
-        #self.chatBoxWorld.Font = font
-        self.chatBoxWorld.ForeColor = textColor
-        self.chatBoxWorld.HorizontalScrollbar = True
-        self.tabWorld.Controls.Add(self.chatBoxWorld)
- 
-        ####################   DEFINE TAB 4   ####################
-        
-        self.tabGuild = TabPage()
-        self.tabGuild.Text = 'Guild Chat'
-        self.tabGuild.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabGuild)
-        
-        self.chatBoxGuild = ListBox()
-        self.chatBoxGuild.Dock = DockStyle.Fill
-        self.chatBoxGuild.BackColor = textboxColor
-        #self.chatBoxGuild.Font = font
-        self.chatBoxGuild.ForeColor = textColor
-        self.chatBoxGuild.HorizontalScrollbar = True
-        self.tabGuild.Controls.Add(self.chatBoxGuild)
- 
-        ####################   DEFINE TAB 5   ####################
-        
-        self.tabParty = TabPage()
-        self.tabParty.Text = 'Party Chat'
-        self.tabParty.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabParty)
-        
-        self.chatBoxParty = ListBox()
-        self.chatBoxParty.Dock = DockStyle.Fill
-        self.chatBoxParty.BackColor = textboxColor
-        #self.chatBoxParty.Font = font
-        self.chatBoxParty.ForeColor = textColor
-        self.chatBoxParty.HorizontalScrollbar = True
-        self.tabParty.Controls.Add(self.chatBoxParty)
- 
-        ####################   DEFINE TAB 6   ####################
-        
-        self.tabOther = TabPage()
-        self.tabOther.Text = 'Other'
-        self.tabOther.BackColor = backgroundColor
-        self.tabControl.TabPages.Add(self.tabOther)
-        
-        self.chatBoxOther = ListBox()
-        self.chatBoxOther.Dock = DockStyle.Fill
-        self.chatBoxOther.BackColor = textboxColor
-        #self.chatBoxOther.Font = font
-        self.chatBoxOther.ForeColor = textColor
-        self.chatBoxOther.HorizontalScrollbar = True
-        self.tabOther.Controls.Add(self.chatBoxOther)
-        
-        ####################   TAB CONTROLS - END   ####################
-        
-        self.Shown += self.startManager
-        
-    ####################   MAIN FORM - END   ####################
-    
 
-####################   EVENT HANDLERS / THREAD MANAGEMENT   ####################
+        self.tabKeys = []
+        self.tabLabels = {}
+        self.exportNames = {}
+        self.tabPages = {}
+        self.grids = {}
+        self.unread = {}
+        for key, label, exportName in TABS:
+            page = TabPage()
+            page.Text = label
+            page.BackColor = backgroundColor
+            self.tabControl.TabPages.Add(page)
 
-####################   TAB SELECTION EVENT HANDLER   ####################
-        
-    def tabSelectedEvent(self,sender,args):
-        
-        if self.tabControl.SelectedIndex == 0:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export All Checked'
-            self.tabCombined.Text = '← All Checked'
-            global tabCombinedCounter
-            tabCombinedCounter = 0
-        
-        elif self.tabControl.SelectedIndex == 1:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export Local Speech'
-            self.tabLocal.Text = 'Local Speech'
-            global tabLocalCounter
-            tabLocalCounter = 0
-        
-        elif self.tabControl.SelectedIndex == 2:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export World Chat'
-            self.tabWorld.Text = 'World Chat'
-            global tabWorldCounter
-            tabWorldCounter = 0
-        
-        elif self.tabControl.SelectedIndex == 3:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export Guild Chat'
-            self.tabGuild.Text = 'Guild Chat'
-            global tabGuildCounter
-            tabGuildCounter = 0
-        
-        elif self.tabControl.SelectedIndex == 4:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export Party Chat'
-            self.tabParty.Text = 'Party Chat'
-            global tabPartyCounter
-            tabPartyCounter = 0
-        
-        elif self.tabControl.SelectedIndex == 5:
-            if Path(journalSpyDirectory).exists():
-                self.exportButton.Text = 'Export Other'
-            self.tabOther.Text = 'Other'
-            global tabOtherCounter
-            tabOtherCounter = 0
+            grid = self.makeGrid()
+            page.Controls.Add(grid)
 
-####################   FILE CREATOR   ####################
-                
-    def fileCreator(self, tabName, chatBox):
-        
-        timeStamp = datetime.now().strftime('%m%d%Y %H%M%S')
-        fileName =  '{} {} - {}.txt'.format(exportFileName, tabName, timeStamp)
-        theFile =   '\\'.join([journalSpyDirectory, fileName])
-        file = open(theFile, 'w+')
-        if Path(theFile).exists():
-            self.systemNotification.ForeColor = textColor
-            self.systemNotification.Text = 'File saved to: {}'.format(journalSpyDirectory)
-            
-            for item in chatBox.Items:
-                
-                file.write(''.join(item))
-                file.write('\n')
+            self.tabKeys.append(key)
+            self.tabLabels[key] = label
+            self.exportNames[key] = exportName
+            self.tabPages[key] = page
+            self.grids[key] = grid
+            self.unread[key] = 0
+
+        self.updateExportButton()
+
+    def makeGrid(self):
+        grid = DataGridView()
+        grid.Dock = DockStyle.Fill
+        grid.ReadOnly = True
+        grid.AllowUserToAddRows = False
+        grid.AllowUserToDeleteRows = False
+        grid.AllowUserToResizeRows = False
+        grid.RowHeadersVisible = False
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        grid.MultiSelect = True
+        grid.ClipboardCopyMode = DataGridViewClipboardCopyMode.Disable # Copy is handled in onGridKeyDown
+        grid.BackgroundColor = textboxColor
+        grid.GridColor = gridLineColor
+        grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal
+        grid.DefaultCellStyle.BackColor = textboxColor
+        grid.DefaultCellStyle.ForeColor = textColor
+        grid.RowTemplate.Height = 20
+        grid.ContextMenuStrip = self.gridMenu
+
+        for name, header, width in COLUMNS:
+            column = DataGridViewTextBoxColumn()
+            column.Name = name
+            column.HeaderText = header
+            column.SortMode = DataGridViewColumnSortMode.Automatic
+            if width > 0:
+                column.Width = max(int(width), fixedMinimumWidth)
+            else:
+                # All filling columns have the same fill weight, so they split the space equally
+                column.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
+                column.MinimumWidth = fillMinimumWidth
+            grid.Columns.Add(column)
+        grid.Columns[TYPE_COLUMN].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+        grid.Columns[SPEAKER_COLUMN].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+
+        grid.CellFormatting += self.onCellFormatting
+        grid.CellMouseDown += self.onGridMouseDown
+        grid.KeyDown += self.onGridKeyDown
+        grid.Sorted += self.onGridSorted
+        enableDoubleBuffering(grid)
+        return grid
+
+    ####################   WINDOW EVENTS (window thread)   ####################
+
+    def selectedTabKey(self):
+        index = self.tabControl.SelectedIndex
+        if index < 0:
+            index = 0
+        return self.tabKeys[index]
+
+    def updateExportButton(self):
+        self.exportButton.Text = 'Export {}'.format(self.exportNames[self.selectedTabKey()])
+
+    def onTabSelected(self, sender, args):
+        key = self.selectedTabKey()
+        self.unread[key] = 0
+        self.tabPages[key].Text = self.tabLabels[key]
+        self.updateExportButton()
+        if self.autoScroll.Checked:
+            self.scrollToNewest(self.grids[key])
+
+    def onAutoScrollChanged(self, sender, args):
+        if self.autoScroll.Checked:
+            self.scrollToNewest(self.grids[self.selectedTabKey()])
+
+    def onGridSorted(self, sender, args):
+        if self.autoScroll.Checked:
+            self.scrollToNewest(sender)
+
+    def showStatus(self, text, isError):
+        self.systemNotification.ForeColor = Color.FromArgb(225, 0, 0) if isError else textColor
+        self.systemNotification.Text = text
+
+    def onCellFormatting(self, sender, e):
+        # The time column stores the raw journal timestamp so it sorts correctly, and is shown formatted
+        if e.ColumnIndex == TIME_COLUMN and e.Value is not None:
+            try:
+                e.Value = formatTime(e.Value)
+                e.FormattingApplied = True
+            except Exception:
+                pass
+
+    def onGridMouseDown(self, sender, e):
+        # Right click selects the row under the mouse, unless it is already part of the selection
+        if e.Button == MouseButtons.Right and e.RowIndex >= 0:
+            row = sender.Rows[e.RowIndex]
+            if not row.Selected:
+                sender.ClearSelection()
+                row.Selected = True
+
+    def onGridKeyDown(self, sender, e):
+        if e.Control and e.KeyCode == Keys.C:
+            e.Handled = True
+            e.SuppressKeyPress = True
+            self.copySelected(sender)
+
+    def onCopyMenu(self, sender, args):
+        grid = self.gridMenu.SourceControl
+        if grid is not None:
+            self.copySelected(grid)
+
+    def rowValues(self, row):
+        values = []
+        for i in range(len(COLUMNS)):
+            value = row.Cells[i].Value
+            if i == TIME_COLUMN and value is not None:
+                value = formatTime(value)
+            values.append('' if value is None else str(value))
+        return values
+
+    def copySelected(self, grid):
+        try:
+            rows = sorted(grid.SelectedRows, key=lambda r: r.Index)
+            if not rows:
+                return
+            text = '\r\n'.join('\t'.join(self.rowValues(row)) for row in rows)
+            copyToClipboard(text)
+            self.showStatus('Copied {} rows.'.format(len(rows)), False)
+        except Exception as e:
+            self.showStatus('Copy failed: {}'.format(e), True)
+
+    def onExport(self, sender, args):
+        key = self.selectedTabKey()
+        try:
+            Directory.CreateDirectory(journalSpyDirectory) # Does nothing if the folder already exists
+            stamp = datetime.now().strftime('%m%d%Y %H%M%S')
+            fileName = safeFileName('{} {} - {}.csv'.format(exportFileName, self.exportNames[key], stamp))
+            fullPath = IOPath.Combine(journalSpyDirectory, fileName)
+            lines = [','.join(csvField(header) for name, header, width in COLUMNS)]
+            for row in self.grids[key].Rows: # In the order shown, so a sorted tab exports sorted
+                lines.append(','.join(csvField(v) for v in self.rowValues(row)))
+            File.WriteAllLines(fullPath, Array[str](lines), UTF8Encoding(True)) # With BOM so Excel reads UTF-8
+            self.showStatus('Saved {} rows to: {}'.format(len(lines) - 1, journalSpyDirectory), False)
+        except Exception as e:
+            self.showStatus('Export failed: {}'.format(e), True)
+
+    def onShown(self, sender, args):
+        worker = Thread(ThreadStart(self.workerLoop))
+        worker.IsBackground = True # Never keeps running after the script or client ends
+        worker.Start()
+
+    def onClosing(self, sender, args):
+        self.stopping = True
+
+    def markDisconnected(self):
+        self.Text = '{} [DISCONNECTED]'.format(scriptName)
+        self.showStatus('Disconnected: journal reading stopped. You can still export.', True)
+
+    ####################   GRID UPDATES (window thread)   ####################
+
+    def sortState(self, grid):
+        # Returns (sorted by time, newest first, sorted by another column)
+        column = grid.SortedColumn
+        if column is None:
+            return True, False, False
+        if column.Index == TIME_COLUMN:
+            return True, grid.SortOrder == SortOrder.Descending, False
+        return False, False, True
+
+    def scrollToNewest(self, grid):
+        count = grid.Rows.Count
+        byTime, newestFirst, otherSort = self.sortState(grid)
+        if count == 0 or otherSort:
+            return # Sorted by type, speaker or message: there is no newest end to follow
+        try:
+            grid.FirstDisplayedScrollingRowIndex = 0 if newestFirst else count - 1
+        except Exception:
+            pass # The grid can refuse while its tab has never been shown
+
+    def addRows(self, grid, rows):
+        byTime, newestFirst, otherSort = self.sortState(grid)
+        wasEmpty = grid.Rows.Count == 0
+
+        for timestamp, label, speaker, message in rows:
+            # New rows are always the newest, so they go at the newest end of a time sort.
+            # The grid does not place new rows into a sort by itself.
+            if newestFirst:
+                grid.Rows.Insert(0, timestamp, label, speaker, message)
+                index = 0
+            else:
+                index = grid.Rows.Add(timestamp, label, speaker, message)
+            style = self.typeStyles.get(label)
+            if style is not None:
+                grid.Rows[index].Cells[TYPE_COLUMN].Style = style
+
+        if otherSort:
+            # Put the new rows in their sorted place and keep the view where the user left it
+            first = grid.FirstDisplayedScrollingRowIndex
+            direction = ListSortDirection.Descending if grid.SortOrder == SortOrder.Descending else ListSortDirection.Ascending
+            grid.Sort(grid.SortedColumn, direction)
+            if 0 <= first < grid.Rows.Count:
+                try:
+                    grid.FirstDisplayedScrollingRowIndex = first
+                except Exception:
+                    pass
+
+        self.trimOldest(grid)
+        if wasEmpty:
+            grid.ClearSelection() # No highlighted first row on start
+        if self.autoScroll.Checked:
+            self.scrollToNewest(grid)
+
+    def trimOldest(self, grid):
+        extra = grid.Rows.Count - maxLinesPerTab
+        if extra < trimBatchSize:
+            return
+        times = [(grid.Rows[i].Cells[TIME_COLUMN].Value, i) for i in range(grid.Rows.Count)]
+        times.sort()
+        oldest = sorted((i for value, i in times[:extra]), reverse=True)
+        for i in oldest: # Highest index first so the remaining indexes stay valid
+            grid.Rows.RemoveAt(i)
+
+    def isDuplicate(self, tabKey, line, timestamp):
+        if duplicateWindowSecs <= 0:
+            return False
+        last = self.lastLineByTab.get(tabKey)
+        if last is not None and last[0] == line and timestamp - last[1] < duplicateWindowSecs:
+            return True
+        self.lastLineByTab[tabKey] = (line, timestamp)
+        return False
+
+    def addLines(self, lines):
+        if self.IsDisposed:
+            return
+
+        pending = {}
+        for timestamp, tabKey, filterKey, label, speaker, message in lines:
+            row = (timestamp, label, speaker, message)
+            if self.isDuplicate(tabKey, (label, speaker, message), timestamp):
+                continue
+            pending.setdefault(tabKey, []).append(row)
+            check = self.checks.get(filterKey)
+            if check is not None and check.Checked:
+                pending.setdefault('combined', []).append(row)
+
+        selected = self.selectedTabKey()
+        for tabKey, rows in pending.items():
+            self.addRows(self.grids[tabKey], rows)
+            if tabKey != selected:
+                self.unread[tabKey] += len(rows)
+                self.tabPages[tabKey].Text = '{} ({})'.format(self.tabLabels[tabKey], self.unread[tabKey])
+
+    ####################   THREAD HELPERS   ####################
+
+    def postToUI(self, fn):
+        # Runs fn on the window thread without waiting for it
+        def safe():
+            try:
+                fn()
+            except Exception as e:
+                self.reportError('window update', e)
+        try:
+            if not self.IsDisposed and self.IsHandleCreated:
+                self.BeginInvoke(Action(safe))
+        except Exception:
+            pass
+
+    def reportError(self, where, e):
+        # Same message is shown at most once every 10 seconds
+        try:
+            msg = 'Journal Spy ({}) error: {}'.format(where, e)
+            if msg != self.lastError or not Timer.Check('journalSpyError'):
+                Misc.SendMessage(msg, 33)
+                self.lastError = msg
+                Timer.Create('journalSpyError', 10000)
+        except Exception:
+            pass
+
+    ####################   JOURNAL WORKER (background thread)   ####################
+    # One thread reads the journal and sorts lines. It never touches the window directly:
+    # it hands each batch to the window thread through postToUI.
+    # Every error is caught so nothing can escape the thread and close the client.
+
+    def readNewLines(self):
+        # RE returns entries with a timestamp strictly after the one given. Entries made in the
+        # same clock tick share a timestamp, so ask from slightly earlier and skip the ones already seen.
+        if self.lastTimestamp is not None and journalTimeNow() < self.lastTimestamp - 5:
+            # Local clock moved back (daylight saving or a time sync). Start again from now.
+            self.lastTimestamp = journalTimeNow()
+            self.seenAtLastTimestamp = set()
+
+        if self.lastTimestamp is None:
+            entries = Journal.GetJournalEntry(-1.0)
         else:
-            self.systemNotification.ForeColor = Color.FromArgb(225, 0, 0)
-            self.systemNotification.Text = 'The file was not created successfully.'
-            
-        file.close()
-        
+            entries = Journal.GetJournalEntry(float(self.lastTimestamp) - 0.001)
 
-####################   BUTTON PRESSED EVENT HANDLER   ####################
-        
-    def btnPressedEvent(self, sender, args):
-        
-        if sender == self.exportButton:
-            
-            if sender.Text == 'Enable Export to File':
-                self.exportButton.Text = 'Create Subfolder'
-   
-                self.systemNotification.ForeColor = Color.FromArgb(225, 0, 0)
-                self.systemNotification.Text = '*** Subfolder \'Journal_Spy\' is required in the RE script folder. Click \'Create Subfolder\' to continue. ***'
-                
-            elif sender.Text == 'Create Subfolder':
-                Path(journalSpyDirectory).mkdir(True, True)
-                
-                if Path(journalSpyDirectory).exists():
-                    if self.tabControl.SelectedIndex == 0:
-                        self.exportButton.Text = 'Export All Checked'
-                    elif self.tabControl.SelectedIndex == 1:
-                        self.exportButton.Text = 'Export Local Speech'
-                    elif self.tabControl.SelectedIndex == 2:
-                        self.exportButton.Text = 'Export World Chat'
-                    elif self.tabControl.SelectedIndex == 3:
-                        self.exportButton.Text = 'Export Guild Chat'
-                    elif self.tabControl.SelectedIndex == 4:
-                        self.exportButton.Text = 'Export Party Chat'
-                    elif self.tabControl.SelectedIndex == 5:
-                        self.exportButton.Text = 'Export Other'
-                    
-                    self.systemNotification.ForeColor = textColor
-                    self.systemNotification.Text = 'Exporting Enabled to: {}'.format(journalSpyDirectory)
-            
-            elif sender.Text == 'Export All Checked':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxCombined)
-            
-            elif sender.Text == 'Export Local Speech':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxLocal)
-            
-            elif sender.Text == 'Export World Chat':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxWorld)
-            
-            elif sender.Text == 'Export Guild Chat':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxGuild)
-            
-            elif sender.Text == 'Export Party Chat':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxParty)
-            
-            elif sender.Text == 'Export Other':
-                #Player.HeadMessage(89, '{}'.format(reScriptDirectory))
-                if Path(journalSpyDirectory).exists():
-                    self.fileCreator(sender.Text, self.chatBoxOther)
+        lines = []
+        for entry in entries:
+            timestamp = entry.Timestamp
+            key = (entry.Type, entry.Name, entry.Serial, entry.Text)
+            if self.lastTimestamp is not None:
+                if timestamp < self.lastTimestamp:
+                    continue
+                if timestamp == self.lastTimestamp and key in self.seenAtLastTimestamp:
+                    continue
+            if self.lastTimestamp is None or timestamp > self.lastTimestamp:
+                self.lastTimestamp = timestamp
+                self.seenAtLastTimestamp = set()
+            self.seenAtLastTimestamp.add(key)
 
-####################   CHECK BOX HANDLER   ####################
+            if containsAny(entry.Text or '', blockMessagesContaining):
+                continue
+            result = classify(entry)
+            if result is None:
+                continue
+            tabKey, filterKey, label, speaker, message = result
+            lines.append((timestamp, tabKey, filterKey, label, speaker, message))
+        return lines
 
-    def startManager(self,s,a):
-        
-        def threadManager():
-    
-            runningThreads = []
-    
-            ####################   READ JOURNAL THREAD   ####################
-            
-            global lastLine
-            lastLine = None
-            
-            def readJournal():
-                
-                ####################   UNREAD MESSAGES TAB COUNTERS   ####################
+    def workerLoop(self):
+        while Player.Connected and not self.stopping:
+            try:
+                lines = self.readNewLines()
+                if lines:
+                    self.postToUI(lambda batch=lines: self.addLines(batch))
+            except Exception as e:
+                self.reportError('journal', e)
+            Misc.Pause(pollIntervalMs)
 
-                def tabUnreadCounters(tabIndex):
-                    
-                    if tabIndex == 0:
-                        global tabCombinedCounter
-                        tabCombinedCounter += 1
-                        self.tabCombined.Text = '← All Checked ({})'.format(tabCombinedCounter)
-            
-                    elif tabIndex == 1:
-                        global tabLocalCounter
-                        tabLocalCounter += 1
-                        self.tabLocal.Text = 'Local Speech ({})'.format(tabLocalCounter)
-                    
-                    elif tabIndex == 2:
-                        global tabWorldCounter
-                        tabWorldCounter += 1
-                        self.tabWorld.Text = 'World Chat ({})'.format(tabWorldCounter)
-                    
-                    elif tabIndex == 3:
-                        global tabGuildCounter
-                        tabGuildCounter += 1
-                        self.tabGuild.Text = 'Guild Chat ({})'.format(tabGuildCounter)
-                    
-                    elif tabIndex == 4:
-                        global tabPartyCounter
-                        tabPartyCounter += 1
-                        self.tabParty.Text = 'Party Chat ({})'.format(tabPartyCounter)
-                    
-                    elif tabIndex == 5:
-                        global tabOtherCounter
-                        tabOtherCounter += 1
-                        self.tabOther.Text = 'Other ({})'.format(tabOtherCounter)
-                
-                ####################   HANDLE JOURNAL ENTRIES   ####################
-                
-                def processJournalEntry(chatBox, entry, tabIndex, checkBox):
-                    
-                    currentEntry = '{}{}'.format(chatBox, entry)
-                    
-                    blockMessage = False
-                    for message in blockMessagesContaining:
-                        if message in entry:
-                            blockMessage = True
-                            break
-                            
-                    if blockMessage == False and currentEntry != self.previousLocal and currentEntry != self.previousWorld and currentEntry != self.previousGuild and currentEntry != self.previousParty and currentEntry != self.previousOther:
-                        timeStamp = datetime.now().strftime('%m/%d  %X')
-                        formattedEntry = '{}  {}'.format(timeStamp,entry)
-                        chatBox.Items.Add(formattedEntry)
-                        
-                        if chatBox == self.chatBoxLocal:
-                            self.previousLocal = '{}{}'.format(chatBox, entry)
-                        elif chatBox == self.chatBoxWorld:
-                            self.previousWorld = '{}{}'.format(chatBox, entry)
-                        elif chatBox == self.chatBoxGuild:
-                            self.previousGuild = '{}{}'.format(chatBox, entry)
-                        elif chatBox == self.chatBoxParty:
-                            self.previousParty = '{}{}'.format(chatBox, entry)
-                        elif chatBox == self.chatBoxOther:
-                            self.previousOther = '{}{}'.format(chatBox, entry)
-                        
-                        if self.autoScroll.Checked == True:
-                            boxCount = chatBox.Items.Count
-                            boxIndex = boxCount - 1
-                            chatBox.SetSelected(boxIndex, True)
-                            
-                        if self.tabControl.SelectedIndex != tabIndex:
-                            tabUnreadCounters(tabIndex)
-                            
-                        if checkBox.Checked == True:
-                            self.chatBoxCombined.Items.Add(formattedEntry)
-                            
-                            if self.autoScroll.Checked == True:
-                                boxCount = self.chatBoxCombined.Items.Count
-                                boxIndex = boxCount - 1
-                                self.chatBoxCombined.SetSelected(boxIndex, True)
-                                
-                            if self.tabControl.SelectedIndex != 0:
-                                tabUnreadCounters(0)
-                
-                
-                global lastLine
-                journalBuffer = Journal.GetJournalEntry(lastLine)
-                journalBufferList = list(journalBuffer)
-                if len(journalBufferList) > 0:
-                    lastLine = journalBufferList[-1]
-                if len(journalBuffer) > 0:
-                    
-                    for entry in journalBuffer:
-                        
-                        if entry.Type == 'System':
-                        
-                            if '<' in entry.Text and '> ' in entry.Text:
-                                    
-                                if '> +' in entry.Text:
-                                    processJournalEntry(self.chatBoxWorld, entry.Text, 2, self.adminsCheck)
-                                    
-                                elif ('<Public> ' in entry.Text or '<Trade> ' in entry.Text):
-                                    processJournalEntry(self.chatBoxWorld, entry.Text, 2, self.worldChatCheck)
-                                    
-                                #elif '<Party> ' in entry.Text:
-                                    #processJournalEntry(self.chatBoxParty, entry.Text, 4, self.partyChatCheck)
-                                    
-                                elif '<ESC> to cancel' in entry.Text:
-                                    processJournalEntry(self.chatBoxOther, entry.Text, 5, self.miscCheck)
-                                    
-                                else:
-                                    processJournalEntry(self.chatBoxGuild, entry.Text, 3, self.guildChatCheck)
-                        
-                            elif 'You see:' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.youSeeCheck)
-                                    
-                            elif 'enveloped by a noxious gas' in entry.Text or 'stepped onto a blade trap' in entry.Text or 'stepped onto a spike trap' in entry.Text or 'feel pain throughout your body' in entry.Text or ((' a ' in entry.Text or ' an ' in entry.Text or '\'s ' in entry.Text) and 'corpse' in entry.Text) or 'damage has been healed' in entry.Text or 'wracked with extreme pain' in entry.Text or 'around in confusion and pain' in entry.Text or (': a ' in entry.Text and 'corpse' in entry.Text) or ('You received' in entry.Text and 'tokens.' in entry.Text) or 'Your deeds in the city of' in entry.Text or 'You deliver a mortal wound' in entry.Text or 'You play jarring music,' in entry.Text or 'You heal what little damage' in entry.Text or 'You attempt to disrupt' in entry.Text or 'Choose the target for ' in entry.Text or 'You pierce your opponent' in entry.Text or 'You launch two shots at ' in entry.Text or 'You have delivered a conc' in entry.Text or 'The whirling attack strike' in entry.Text or 'You are bleeding!' in entry.Text or 'That being is not damaged' in entry.Text or 'You have been cured of all' in entry.Text or 'Some damage has been healed' in entry.Text or 'You finish applying the ' in entry.Text or 'You begin applying the ' in entry.Text or 'You did not earn the right' in entry.Text or 'Warmode dismount blocked.' in entry.Text or 'Choose a corpse to claim' in entry.Text or 'Choose another corpse to' in entry.Text or 'As a reward for slaying ' in entry.Text or 'You have delivered a crushing' in entry.Text or 'Your concentration is ' in entry.Text or 'bleeding profusely' in entry.Text or 're already casting a spell.' in entry.Text or 'vered from casting a spell.' in entry.Text or 'corpse and receive a reward.' in entry.Text or 'and are in severe pain!' in entry.Text or 'you are no longer bleeding!' in entry.Text or 'You must have at least' in entry.Text or 'spasm uncontrollably' in entry.Text or 'can breathe normally' in entry.Text or 'resisting magical energy' in entry.Text or 'target is not affected' in entry.Text or 'Oath has been broken' in entry.Text or 'dry and corpselike' in entry.Text or 'looks ill' in entry.Text or 'hits its mark with velocity' in entry.Text or 'Your target is bleeding' in entry.Text or 'looks extrememly ill' in entry.Text or '%]' in entry.Text or 't claim a corpse you did not kill' in entry.Text or 'You are too far away to claim that corpse' in entry.Text or 'You feel a bit nauseous' in entry.Text or 'You are in extreme pain,' in entry.Text or 'You feel disoriented and nauseous' in entry.Text or 'poison seems to have no effect' in entry.Text or 'looks extremely ill.' in entry.Text or 'seems resistant to the poison' in entry.Text or '*You feel a bit nauseous*' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.combatCheck)
-                            
-                            elif '] +' in entry.Text or '> +' in entry.Text or '] Announcement by +' in entry.Text or 'Staff message from +' in entry.Text or '] +' in entry.Text:
-                                processJournalEntry(self.chatBoxWorld, entry.Text, 2, self.adminsCheck)
-                            
-                            elif ('is being invaded by' in entry.Text and '. Please come help!' in entry.Text) or ('is safe!' in entry.Text and 'has been defeated!' in entry.Text) or ('has been protected but' in entry.Text and 'for the final battle!' in entry.Text):
-                                processJournalEntry(self.chatBoxWorld, entry.Text, 2, self.miscCheck)
-                                    
-                            elif ' has logged ' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.loggedInOutCheck)
-                                    
-                            elif 'The world will save in ' in entry.Text or 'The world is saving, please wait.' in entry.Text or 'No Current News' in entry.Text or 'World save complete. ' in entry.Text or 'Power Save! All players online ' in entry.Text or 'Power Save! All online players ' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.worldSaveCheck)
-                                    
-                            elif 'Your strength has changed' in entry.Text or 'Your dexterity has changed' in entry.Text or 'Your intelligence has changed' in entry.Text or 'Your skill in' in entry.Text or 'has gained a level' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.levelUpsCheck)
-                                    
-                            elif 'Pray, bretheren' in entry.Text or 'Alas, poor' in entry.Text or 'Another soul has' in entry.Text or 'Rest in peace,' in entry.Text or 'We mourn the passing' in entry.Text or ' is heard throughout the land.' in entry.Text or 'shall arise again for vengance!' in entry.Text or ' the regions beyond the grave.' in entry.Text or 'has fallen victim to' in entry.Text or 'shall rise again for vengance' in entry.Text or 'has been slain in a br' in entry.Text or 'inflicted the final wo' in entry.Text or ('couldn' in entry.Text and 't withstand' in entry.Text) or 'has lost their life in battle to' in entry.Text or 'has succumbed to their wounds and has perished' in entry.Text or 'may god have mercy on your soul' in entry.Text or 'Death comes for us all, but on this day, for' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.deathRollCheck)
-                                    
-                            elif 'elcome the newest member ' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.newestMemberCheck)
-                                    
-                            elif 'Stealth steps' in entry.Text or 'You begin to move quietely' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.stealthStepsCheck)
-                            
-                            elif ' : ' in entry.Text or 'hidden yourself well' in entry.Text or 'seem to hide right now' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.miscCheck)
-                        
-                            else: # This is the catch-all for everything else
-                                processJournalEntry(self.chatBoxOther, entry.Text, 5, self.miscCheck)
-                            
-                        elif entry.Type == 'Guild':
-                            formattedEntry = '[Guild] {}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxGuild, formattedEntry, 3, self.guildChatCheck)
-                            
-                        elif entry.Type == 'Party':
-                            formattedEntry = '[Party] {}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxParty, formattedEntry, 4, self.partyChatCheck)
-                            
-                        elif entry.Type == 'Regular':
-                            formattedEntry = '{}: {}'.format(entry.Name, entry.Text)
-                            if 'enveloped by a noxious gas' in entry.Text or 'stepped onto a blade trap' in entry.Text or 'stepped onto a spike trap' in entry.Text or 'feel pain throughout your body' in entry.Text or ((' a ' in entry.Text or ' an ' in entry.Text or '\'s ' in entry.Text) and 'corpse' in entry.Text) or 'damage has been healed' in entry.Text or 'wracked with extreme pain' in entry.Text or 'around in confusion and pain' in entry.Text or (': a ' in entry.Text and 'corpse' in entry.Text) or ('You received' in entry.Text and 'tokens.' in entry.Text) or 'Your deeds in the city of' in entry.Text or 'You deliver a mortal wound' in entry.Text or 'You play jarring music,' in entry.Text or 'You heal what little damage' in entry.Text or 'You attempt to disrupt' in entry.Text or 'Choose the target for ' in entry.Text or 'You pierce your opponent' in entry.Text or 'You launch two shots at ' in entry.Text or 'You have delivered a conc' in entry.Text or 'The whirling attack strike' in entry.Text or 'You are bleeding!' in entry.Text or 'That being is not damaged' in entry.Text or 'You have been cured of all' in entry.Text or 'Some damage has been healed' in entry.Text or 'You finish applying the ' in entry.Text or 'You begin applying the ' in entry.Text or 'You did not earn the right' in entry.Text or 'Warmode dismount blocked.' in entry.Text or 'Choose a corpse to claim' in entry.Text or 'Choose another corpse to' in entry.Text or 'As a reward for slaying ' in entry.Text or 'You have delivered a crushing' in entry.Text or 'Your concentration is ' in entry.Text or 'bleeding profusely' in entry.Text or 're already casting a spell.' in entry.Text or 'vered from casting a spell.' in entry.Text or 'corpse and receive a reward.' in entry.Text or 'and are in severe pain!' in entry.Text or 'you are no longer bleeding!' in entry.Text or 'You must have at least' in entry.Text or 'spasm uncontrollably' in entry.Text or 'can breathe normally' in entry.Text or 'resisting magical energy' in entry.Text or 'target is not affected' in entry.Text or 'Oath has been broken' in entry.Text or 'dry and corpselike' in entry.Text or 'looks ill' in entry.Text or 'hits its mark with velocity' in entry.Text or 'Your target is bleeding' in entry.Text or 'looks extrememly ill' in entry.Text or '%]' in entry.Text or 't claim a corpse you did not kill' in entry.Text or 'You are too far away to claim that corpse' in entry.Text or 'You feel a bit nauseous' in entry.Text or 'You are in extreme pain,' in entry.Text or 'You feel disoriented and nauseous' in entry.Text or 'poison seems to have no effect' in entry.Text or 'looks extremely ill.' in entry.Text or 'seems resistant to the poison' in entry.Text or '*You feel a bit nauseous*' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.combatCheck)
-                            elif ' : ' in entry.Text or 'lock quickly yields' in entry.Text or 'appears to be locked.' in entry.Text or 'make anything of the map' in entry.Text or 'decode a treasure map' in entry.Text or 'marked by the red pin' in entry.Text or 'hidden yourself well' in entry.Text or 'seem to hide right now' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            else:
-                                processJournalEntry(self.chatBoxLocal, formattedEntry, 1, self.localSpeechCheck)
-                            
-                        elif entry.Type == 'Emote':
-                            formattedEntry = '{}: *Emote* {}'.format(entry.Name, entry.Text)
-                            if 'poison seems to have no effect' in entry.Text or 'seems resistant to the poison' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.combatCheck)
-                            elif 'begins taming a creature' in entry.Text:
-                                processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            else:
-                                processJournalEntry(self.chatBoxLocal, formattedEntry, 1, self.localSpeechCheck)
-                            
-                        elif entry.Type == 'Label':
-                            formattedEntry = 'You see: {}'.format(entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.youSeeCheck)
-                            
-                        elif entry.Type == 'Focus':
-                            formattedEntry = '***FOCUS TYPE***{}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            
-                        elif entry.Type == 'Whisper':
-                            formattedEntry = '{}: *Whisper* {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxLocal, formattedEntry, 1, self.localSpeechCheck)
-                            
-                        elif entry.Type == 'Yell':
-                            formattedEntry = '{}: *Yell* {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxLocal, formattedEntry, 1, self.localSpeechCheck)
-                            
-                        elif entry.Type == 'Spell':
-                            formattedEntry = '{}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            
-                        elif entry.Type == 'Alliance':
-                            formattedEntry = '[Alliance] {}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            
-                        elif entry.Type == 'Encoded':
-                            formattedEntry = '***ENCODED TYPE***{}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            
-                        elif entry.Type == 'Special':
-                            formattedEntry = '***SPECIAL TYPE***{}: {}'.format(entry.Name, entry.Text)
-                            processJournalEntry(self.chatBoxOther, formattedEntry, 5, self.miscCheck)
-                            
-                    
-                runningThreads.remove('readJournal')
-                    
-                
-            ####################   THREAD STARTER   ####################
+        if not self.stopping:
+            self.postToUI(self.markDisconnected)
 
-            while Misc.ReadSharedValue('run') == True:
-                if not 'readJournal' in runningThreads:
-                    runningThreads.append('readJournal')
-                    Thread(ThreadStart(readJournal)).Start()
-                    
-                Misc.Pause(50)
-
-        Thread(ThreadStart(threadManager)).Start()
-                    
-    ####################   THREAD STOPPER   ####################
-        
-    def abortThreads(self, sender, args):
-        Misc.SetSharedValue('run',False)
-        #Thread(ThreadStart(readJournal)).Abort()
-        #Thread(ThreadStart(threadManager)).Abort()
-                    
 ####################   RUN APP   ####################
-    
-#for item in blockMessagesContaining:
-    #Journal.FilterText(item)
-    
+
 Application.EnableVisualStyles()
-Application.Run(mainForm())
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+journalSpyForm = JournalSpyForm()
+try:
+    Application.Run(journalSpyForm)
+finally:
+    journalSpyForm.stopping = True # Also stops the worker when the script is stopped from RE
